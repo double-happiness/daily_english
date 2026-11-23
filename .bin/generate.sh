@@ -4,7 +4,8 @@
 #   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送
 #   - 当天文件已存在：只补做没完成的提交和推送（比如上次推送时断网），所以重复触发没有影响
 # 只提交当天新生成的文件，不碰工作区里其他未提交的改动；不 force push。
-# 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1
+# 推送成功后把当天 20 句发到微信（Server酱），每天只发一次；sendkey 放在 ~/.config/daily_english/serverchan_key，没配就跳过。
+# 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1（同时关闭微信推送）
 set -euo pipefail
 
 LEARN_DIR="${LEARN_DIR:-$HOME/研发英语}"
@@ -16,6 +17,8 @@ REMOTE="origin"
 LOG_DIR="$LEARN_DIR/.logs"
 LOG_FILE="$LOG_DIR/$TARGET_DATE.log"
 LOCK_DIR="$LOG_DIR/.lock"
+SENDKEY_FILE="${SENDKEY_FILE:-$HOME/.config/daily_english/serverchan_key}"
+WECHAT_MARK="$LOG_DIR/$TARGET_DATE.wechat-sent"
 
 mkdir -p "$LOG_DIR"
 
@@ -90,6 +93,40 @@ push_if_ahead() {
   log "pushed $ahead commit(s) to $REMOTE/$BRANCH"
 }
 
+# 把当天文件发到微信（Server酱）。发成功后写标记文件，重复触发不会重复发；
+# 发送失败只记日志、不写标记，下次触发时重试，不影响提交推送的结果
+send_wechat() {
+  local file="$1" name day topic key resp
+  [[ "${NO_NOTIFY:-0}" == "1" ]] && return 0
+  [[ -f "$WECHAT_MARK" ]] && return 0
+
+  key="${SERVERCHAN_KEY:-}"
+  if [[ -z "$key" && -f "$SENDKEY_FILE" ]]; then
+    key="$(tr -d '[:space:]' <"$SENDKEY_FILE")"
+  fi
+  if [[ -z "$key" ]]; then
+    log "warn: no Server酱 sendkey, skip wechat push"
+    return 0
+  fi
+
+  name="$(basename "$file")"
+  day="$(sed -E 's/^[0-9-]+_Day([0-9]+)_.*$/\1/' <<<"$name")"
+  topic="$(sed -E 's/^[0-9-]+_Day[0-9]+_(.*)\.md$/\1/' <<<"$name")"
+
+  if ! resp="$(curl -sS -m 20 "https://sctapi.ftqq.com/$key.send" \
+    --data-urlencode "title=研发英语 Day$day $topic" \
+    --data-urlencode "desp@$file" 2>&1)"; then
+    log "warn: wechat push failed, will retry next run: $resp"
+    return 1
+  fi
+  if ! grep -qE '"code":[[:space:]]*0[,}]' <<<"$resp"; then
+    log "warn: wechat push rejected, will retry next run: $resp"
+    return 1
+  fi
+  touch "$WECHAT_MARK"
+  log "wechat pushed: $name"
+}
+
 # 提交并推送；当前不在 main 分支或不是 git 仓库时跳过，避免推错分支
 sync_to_remote() {
   local file="$1" name current_branch
@@ -108,6 +145,7 @@ sync_to_remote() {
 
   commit_todays_file "$file"
   if push_if_ahead; then
+    send_wechat "$file" || true
     return 0
   fi
   notify "$name 已生成并提交，推送失败（可能是网络问题），下次登录或明早会自动重试"
