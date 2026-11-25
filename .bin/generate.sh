@@ -5,13 +5,16 @@
 #   - 当天文件已存在：只补做没完成的提交和推送（比如上次推送时断网），所以重复触发没有影响
 # 只提交当天新生成的文件，不碰工作区里其他未提交的改动；不 force push。
 # 推送成功后把当天 20 句发到微信（Server酱），每天只发一次；sendkey 放在 ~/.config/daily_english/serverchan_key，没配就跳过。
+# claude -p 超过 GENERATE_TIMEOUT_SECONDS（默认 20 分钟）没结束就终止：生成途中系统睡眠会让 API 连接挂死，进程永远等不到响应。
 # 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1（同时关闭微信推送）
+#   CLAUDE_BIN=<假的 claude 脚本> GENERATE_TIMEOUT_SECONDS=<秒>
 set -euo pipefail
 
 LEARN_DIR="${LEARN_DIR:-$HOME/研发英语}"
 TARGET_DATE="${TARGET_DATE:-$(date +%F)}"
 PROMPT_FILE="$HOME/研发英语/.bin/prompt.md"
-CLAUDE_BIN="$HOME/.local/bin/claude"
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+GENERATE_TIMEOUT_SECONDS="${GENERATE_TIMEOUT_SECONDS:-1200}"
 BRANCH="main"
 REMOTE="origin"
 LOG_DIR="$LEARN_DIR/.logs"
@@ -32,6 +35,35 @@ fail() { log "error: $1"; notify "$1，日志见 .logs/$TARGET_DATE.log"; exit 1
 todays_file() { compgen -G "$LEARN_DIR/${TARGET_DATE}_Day*.md" | head -n 1 || true; }
 
 sentence_count() { grep -cE '^### [0-9]+\. ' "$1" || true; }
+
+# 带超时运行命令，超时返回 124。看门狗每 5 秒对一次墙上时间（date），不依赖 sleep 计时：
+# 系统睡眠期间 sleep 的计时可能暂停，按墙上时间算，唤醒后几秒内就能发现已经超时。
+# 超时先发 TERM，10 秒后还没退出再发 KILL。
+run_with_timeout() {
+  local timeout_seconds="$1" deadline command_pid watchdog_pid status=0
+  shift
+  deadline=$(($(date +%s) + timeout_seconds))
+
+  "$@" &
+  command_pid=$!
+
+  (
+    while (($(date +%s) < deadline)); do sleep 5; done
+    kill -TERM "$command_pid" 2>/dev/null || exit 0
+    sleep 10
+    kill -KILL "$command_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+
+  wait "$command_pid" || status=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  if (($(date +%s) >= deadline)); then
+    return 124
+  fi
+  return "$status"
+}
 
 # 当天文件如果还没进版本库，校验通过后单独提交（只 add 这一个文件）
 commit_todays_file() {
@@ -181,14 +213,19 @@ prompt="${prompt//\{\{DIR\}\}/$LEARN_DIR}"
 log "start generating for $TARGET_DATE in $LEARN_DIR"
 
 # 只放行读、搜、新建文件；不加载 MCP 服务，禁用 shell / 编辑 / 联网
-if ! "$CLAUDE_BIN" -p "$prompt" \
+claude_status=0
+run_with_timeout "$GENERATE_TIMEOUT_SECONDS" "$CLAUDE_BIN" -p "$prompt" \
   --strict-mcp-config \
   --permission-mode acceptEdits \
   --allowedTools "Read" "Glob" "Grep" "Write" \
   --disallowedTools "Bash" "Edit" "NotebookEdit" "WebFetch" "WebSearch" "Agent" \
   --no-session-persistence \
-  >>"$LOG_FILE" 2>&1; then
-  fail "生成失败：claude 异常退出"
+  >>"$LOG_FILE" 2>&1 || claude_status=$?
+if [[ "$claude_status" == "124" ]]; then
+  # 变量后紧跟中文全角标点时必须加花括号：macOS 自带的 bash 3.2 会把全角字符当成变量名的一部分
+  fail "生成超时：claude 超过 $(((GENERATE_TIMEOUT_SECONDS + 59) / 60)) 分钟未结束（多半是生成途中系统睡眠），已终止"
+elif [[ "$claude_status" != "0" ]]; then
+  fail "生成失败：claude 异常退出（退出码 ${claude_status}）"
 fi
 
 generated="$(todays_file)"
