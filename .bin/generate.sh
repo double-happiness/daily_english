@@ -185,15 +185,30 @@ sync_to_remote() {
   return 1
 }
 
-# 防并发：登录触发和定时触发可能撞在一起。超过 30 分钟的锁视为上次异常退出留下的，清掉。
-if [[ -d "$LOCK_DIR" ]] && [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30)" ]]; then
+# 防并发：登录触发和定时触发可能撞在一起。
+# 锁目录里记下持锁进程号，只有那个进程已经不在了（上次异常退出留下的锁）才清掉；
+# 不能只看锁的年龄，否则持锁进程还在跑时锁会被清掉，两次生成同时进行。
+# 旧版本留下的锁没有进程号，超过 30 分钟视为过期。
+lock_is_stale() {
+  local pid
+  if [[ -f "$LOCK_DIR/pid" ]]; then
+    pid="$(<"$LOCK_DIR/pid")"
+    # 核对命令行，防止进程号被别的进程复用
+    ! ps -p "$pid" -o command= 2>/dev/null | grep -q 'generate\.sh'
+  else
+    [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30)" ]]
+  fi
+}
+if [[ -d "$LOCK_DIR" ]] && lock_is_stale; then
   log "removing stale lock"
-  rmdir "$LOCK_DIR"
+  rm -f "$LOCK_DIR/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+echo "$$" >"$LOCK_DIR/pid"
 
 cd "$LEARN_DIR"
 
