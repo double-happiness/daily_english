@@ -159,20 +159,21 @@ send_wechat() {
   log "wechat pushed: $name"
 }
 
-# 提交并推送；当前不在 main 分支或不是 git 仓库时跳过，避免推错分支
+# 提交并推送；当前不在 main 分支或不是 git 仓库时跳过，避免推错分支。
+# 返回 0：已推送；1：推送失败；2：跳过（没提交也没推送，调用方不能报「已推送」）
 sync_to_remote() {
   local file="$1" name current_branch
   name="$(basename "$file")"
 
   if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     log "warn: $LEARN_DIR is not a git repo, skip commit and push"
-    return 0
+    return 2
   fi
   current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo detached)"
   if [[ "$current_branch" != "$BRANCH" ]]; then
     log "warn: current branch is $current_branch, not $BRANCH, skip commit and push"
-    notify "$name 已生成，但当前分支是 $current_branch，未提交推送"
-    return 0
+    notify "$name 已生成，但当前分支是 ${current_branch}，未提交推送"
+    return 2
   fi
 
   commit_todays_file "$file"
