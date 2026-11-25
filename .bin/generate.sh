@@ -1,13 +1,15 @@
 #!/bin/bash
 # 每日生成研发英语学习文件，提交并推送到远端。
-# 由 launchd 在每天 07:00 和用户登录时触发：
-#   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送
+# 由 launchd 在每天 07:00、用户登录时触发，并且每 30 分钟触发一次用来重试：
+#   - 当天已全部完成（文件已推到远端，微信已发或不需要发）：直接退出，不联网、不写日志
+#   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送；每天最多尝试 MAX_ATTEMPTS（默认 6）次
 #   - 当天文件已存在：只补做没完成的提交和推送（比如上次推送时断网），所以重复触发没有影响
+# 同一条桌面通知每天只弹一次，重试时遇到同样的问题不会反复打扰。
 # 只提交当天新生成的文件，不碰工作区里其他未提交的改动；不 force push。
 # 推送成功后把当天 20 句发到微信（Server酱），每天只发一次；sendkey 放在 ~/.config/daily_english/serverchan_key，没配就跳过。
 # claude -p 超过 GENERATE_TIMEOUT_SECONDS（默认 20 分钟）没结束就终止：生成途中系统睡眠会让 API 连接挂死，进程永远等不到响应。
 # 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1（同时关闭微信推送）
-#   CLAUDE_BIN=<假的 claude 脚本> GENERATE_TIMEOUT_SECONDS=<秒>
+#   CLAUDE_BIN=<假的 claude 脚本> GENERATE_TIMEOUT_SECONDS=<秒> MAX_ATTEMPTS=<次数>
 set -euo pipefail
 
 LEARN_DIR="${LEARN_DIR:-$HOME/研发英语}"
@@ -15,6 +17,7 @@ TARGET_DATE="${TARGET_DATE:-$(date +%F)}"
 PROMPT_FILE="$HOME/研发英语/.bin/prompt.md"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 GENERATE_TIMEOUT_SECONDS="${GENERATE_TIMEOUT_SECONDS:-1200}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
 BRANCH="main"
 REMOTE="origin"
 LOG_DIR="$LEARN_DIR/.logs"
@@ -22,12 +25,18 @@ LOG_FILE="$LOG_DIR/$TARGET_DATE.log"
 LOCK_DIR="$LOG_DIR/.lock"
 SENDKEY_FILE="${SENDKEY_FILE:-$HOME/.config/daily_english/serverchan_key}"
 WECHAT_MARK="$LOG_DIR/$TARGET_DATE.wechat-sent"
+NOTIFIED_FILE="$LOG_DIR/$TARGET_DATE.notified"
 
 mkdir -p "$LOG_DIR"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
+# 同一条通知每天只弹一次：弹过的内容记在 NOTIFIED_FILE 里
 notify() {
   [[ "${NO_NOTIFY:-0}" == "1" ]] && return 0
+  if [[ -f "$NOTIFIED_FILE" ]] && grep -qxF -- "$1" "$NOTIFIED_FILE"; then
+    return 0
+  fi
+  printf '%s\n' "$1" >>"$NOTIFIED_FILE"
   osascript -e "display notification \"$1\" with title \"研发英语\"" >/dev/null 2>&1 || true
 }
 fail() { log "error: $1"; notify "$1，日志见 .logs/$TARGET_DATE.log"; exit 1; }
@@ -125,6 +134,15 @@ push_if_ahead() {
   log "pushed $ahead commit(s) to $REMOTE/$BRANCH"
 }
 
+# 读 Server酱 sendkey：环境变量优先，其次 SENDKEY_FILE；都没配时输出空串
+read_sendkey() {
+  local key="${SERVERCHAN_KEY:-}"
+  if [[ -z "$key" && -f "$SENDKEY_FILE" ]]; then
+    key="$(tr -d '[:space:]' <"$SENDKEY_FILE")"
+  fi
+  printf '%s' "$key"
+}
+
 # 把当天文件发到微信（Server酱）。发成功后写标记文件，重复触发不会重复发；
 # 发送失败只记日志、不写标记，下次触发时重试，不影响提交推送的结果
 send_wechat() {
@@ -132,10 +150,7 @@ send_wechat() {
   [[ "${NO_NOTIFY:-0}" == "1" ]] && return 0
   [[ -f "$WECHAT_MARK" ]] && return 0
 
-  key="${SERVERCHAN_KEY:-}"
-  if [[ -z "$key" && -f "$SENDKEY_FILE" ]]; then
-    key="$(tr -d '[:space:]' <"$SENDKEY_FILE")"
-  fi
+  key="$(read_sendkey)"
   if [[ -z "$key" ]]; then
     log "warn: no Server酱 sendkey, skip wechat push"
     return 0
@@ -181,11 +196,21 @@ sync_to_remote() {
     send_wechat "$file" || true
     return 0
   fi
-  notify "$name 已生成并提交，推送失败（可能是网络问题），下次登录或明早会自动重试"
+  notify "$name 已生成并提交，推送失败（可能是网络问题），30 分钟后自动重试"
   return 1
 }
 
-# 防并发：登录触发和定时触发可能撞在一起。
+# 当天已全部完成：文件已在远端分支里（按上次 fetch / push 记下的远端引用判断，不联网），
+# 微信也已发过或不需要发。每 30 分钟的重试触发靠它直接退出。
+already_done() {
+  local name
+  name="$(basename "$1")"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  git cat-file -e "$REMOTE/$BRANCH:$name" 2>/dev/null || return 1
+  [[ "${NO_NOTIFY:-0}" == "1" || -f "$WECHAT_MARK" || -z "$(read_sendkey)" ]]
+}
+
+# 防并发：登录触发、定时触发和 30 分钟重试可能撞在一起。
 # 锁目录里记下持锁进程号，只有那个进程已经不在了（上次异常退出留下的锁）才清掉；
 # 不能只看锁的年龄，否则持锁进程还在跑时锁会被清掉，两次生成同时进行。
 # 旧版本留下的锁没有进程号，超过 30 分钟视为过期。
@@ -212,9 +237,10 @@ echo "$$" >"$LOCK_DIR/pid"
 
 cd "$LEARN_DIR"
 
-# 当天文件已存在：只补做提交和推送
+# 当天文件已存在：已全部完成就直接退出，否则只补做提交、推送和发微信
 existing="$(todays_file)"
 if [[ -n "$existing" ]]; then
+  already_done "$existing" && exit 0
   sync_to_remote "$existing" || true
   exit 0
 fi
@@ -225,6 +251,16 @@ fi
 prompt="$(<"$PROMPT_FILE")"
 prompt="${prompt//\{\{DATE\}\}/$TARGET_DATE}"
 prompt="${prompt//\{\{DIR\}\}/$LEARN_DIR}"
+
+# 每天最多尝试 MAX_ATTEMPTS 次，避免一直失败时每 30 分钟调一次 claude
+attempts=0
+if [[ -f "$LOG_FILE" ]]; then
+  attempts="$(grep -c '] start generating for ' "$LOG_FILE" || true)"
+fi
+if ((attempts >= MAX_ATTEMPTS)); then
+  notify "今天已尝试生成 ${attempts} 次仍未成功，停止自动重试；查看日志后手动运行 MAX_ATTEMPTS=99 bash .bin/generate.sh"
+  exit 0
+fi
 
 log "start generating for $TARGET_DATE in $LEARN_DIR"
 
@@ -239,7 +275,7 @@ run_with_timeout "$GENERATE_TIMEOUT_SECONDS" "$CLAUDE_BIN" -p "$prompt" \
   >>"$LOG_FILE" 2>&1 || claude_status=$?
 if [[ "$claude_status" == "124" ]]; then
   # 变量后紧跟中文全角标点时必须加花括号：macOS 自带的 bash 3.2 会把全角字符当成变量名的一部分
-  fail "生成超时：claude 超过 $(((GENERATE_TIMEOUT_SECONDS + 59) / 60)) 分钟未结束（多半是生成途中系统睡眠），已终止"
+  fail "生成超时：claude 超过 $(((GENERATE_TIMEOUT_SECONDS + 59) / 60)) 分钟未结束（多半是生成途中系统睡眠），已终止，30 分钟后自动重试"
 elif [[ "$claude_status" != "0" ]]; then
   fail "生成失败：claude 异常退出（退出码 ${claude_status}）"
 fi
