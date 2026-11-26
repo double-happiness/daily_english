@@ -32,6 +32,9 @@ LEARN_DIR=<目录> TARGET_DATE=2026-12-01 NO_NOTIFY=1 bash .bin/generate.sh
 # 测超时 / 失败路径：换成假的 claude 脚本
 LEARN_DIR=<目录> TARGET_DATE=2026-12-01 NO_NOTIFY=1 CLAUDE_BIN=<假脚本> GENERATE_TIMEOUT_SECONDS=5 bash .bin/generate.sh
 
+# 测半醒（DarkWake）跳过：假 pmset 输出不含 Graphics 的系统能力
+LEARN_DIR=<目录> TARGET_DATE=2026-12-01 NO_NOTIFY=1 PMSET_BIN=<假脚本> bash .bin/generate.sh
+
 # 当天已尝试 6 次、自动重试停止后手动重跑
 MAX_ATTEMPTS=99 bash .bin/generate.sh
 

@@ -4,12 +4,14 @@
 #   - 当天已全部完成（文件已推到远端，微信已发或不需要发）：直接退出，不联网、不写日志
 #   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送；每天最多尝试 MAX_ATTEMPTS（默认 6）次
 #   - 当天文件已存在：只补做没完成的提交和推送（比如上次推送时断网），所以重复触发没有影响
+#   - 电脑处于"半醒"（DarkWake，合盖睡眠期间系统短暂醒来做后台维护）：什么都不做，等真正开机再说
 # 同一条桌面通知每天只弹一次，重试时遇到同样的问题不会反复打扰。
 # 只提交当天新生成的文件，不碰工作区里其他未提交的改动；不 force push。
 # 推送成功后把当天 20 句发到微信（Server酱），每天只发一次；sendkey 放在 ~/.config/daily_english/serverchan_key，没配就跳过。
 # claude -p 超过 GENERATE_TIMEOUT_SECONDS（默认 20 分钟）没结束就终止：生成途中系统睡眠会让 API 连接挂死，进程永远等不到响应。
 # 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1（同时关闭微信推送）
 #   CLAUDE_BIN=<假的 claude 脚本> GENERATE_TIMEOUT_SECONDS=<秒> MAX_ATTEMPTS=<次数>
+#   PMSET_BIN=<假的 pmset 脚本>（模拟半醒 / 完全唤醒）
 set -euo pipefail
 
 LEARN_DIR="${LEARN_DIR:-$HOME/研发英语}"
@@ -18,6 +20,7 @@ PROMPT_FILE="$HOME/研发英语/.bin/prompt.md"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 GENERATE_TIMEOUT_SECONDS="${GENERATE_TIMEOUT_SECONDS:-1200}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
+PMSET_BIN="${PMSET_BIN:-/usr/bin/pmset}"
 BRANCH="main"
 REMOTE="origin"
 LOG_DIR="$LEARN_DIR/.logs"
@@ -210,6 +213,23 @@ already_done() {
   [[ "${NO_NOTIFY:-0}" == "1" || -f "$WECHAT_MARK" || -z "$(read_sendkey)" ]]
 }
 
+# 电脑是否完全唤醒。合盖睡眠期间系统会每隔十几分钟"半醒"（DarkWake）几秒做后台维护，
+# launchd 会趁这时补触发错过的任务；这时启动生成，几秒后系统又睡回去，claude -p 必然卡到超时。
+# 半醒时 pmset 报告的系统能力里没有 Graphics，完全唤醒时有（屏幕熄灭但系统醒着也算完全唤醒）。
+# pmset 调用失败或输出看不懂时按"完全唤醒"处理，不挡住生成。
+system_fully_awake() {
+  local state
+  if ! state="$("$PMSET_BIN" -g systemstate 2>&1)"; then
+    log "warn: pmset -g systemstate failed, assume fully awake: $state"
+    return 0
+  fi
+  if ! grep -q 'Current System Capabilities are:' <<<"$state"; then
+    log "warn: unexpected pmset output, assume fully awake: $state"
+    return 0
+  fi
+  grep -qE 'Current System Capabilities are:.*Graphics' <<<"$state"
+}
+
 # 防并发：登录触发、定时触发和 30 分钟重试可能撞在一起。
 # 锁目录里记下持锁进程号，只有那个进程已经不在了（上次异常退出留下的锁）才清掉；
 # 不能只看锁的年龄，否则持锁进程还在跑时锁会被清掉，两次生成同时进行。
@@ -237,10 +257,20 @@ echo "$$" >"$LOCK_DIR/pid"
 
 cd "$LEARN_DIR"
 
-# 当天文件已存在：已全部完成就直接退出，否则只补做提交、推送和发微信
+# 当天已全部完成就直接退出（不联网、不写日志）
 existing="$(todays_file)"
 if [[ -n "$existing" ]]; then
   already_done "$existing" && exit 0
+fi
+
+# 半醒时不生成也不推送，不算一次尝试：等电脑完全唤醒后的下一次触发再做
+if ! system_fully_awake; then
+  log "skip: system is in dark wake, wait until fully awake"
+  exit 0
+fi
+
+# 当天文件已存在：只补做提交、推送和发微信
+if [[ -n "$existing" ]]; then
   sync_to_remote "$existing" || true
   exit 0
 fi
