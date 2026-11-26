@@ -1,8 +1,9 @@
 #!/bin/bash
 # 每日生成研发英语学习文件，提交并推送到远端。
-# 由 launchd 在每天 07:00、用户登录时触发，并且每 30 分钟触发一次用来重试：
+# 由 launchd 在每天 07:00、用户登录时触发，并且每 5 分钟触发一次检查（电脑真正醒来后几分钟内就能补做）：
 #   - 当天已全部完成（文件已推到远端，微信已发或不需要发）：直接退出，不联网、不写日志
-#   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送；每天最多尝试 MAX_ATTEMPTS（默认 6）次
+#   - 当天文件还没生成：调用 claude -p 生成 → 校验 → 提交 → 推送；每天最多尝试 MAX_ATTEMPTS（默认 6）次，
+#     失败后至少隔 RETRY_INTERVAL_SECONDS（默认 30 分钟）再试；超时（多半是生成途中睡着了）不受这个限制，醒着时马上重试
 #   - 当天文件已存在：只补做没完成的提交和推送（比如上次推送时断网），所以重复触发没有影响
 #   - 电脑处于"半醒"（DarkWake，合盖睡眠期间系统短暂醒来做后台维护）：什么都不做，等真正开机再说
 # 同一条桌面通知每天只弹一次，重试时遇到同样的问题不会反复打扰。
@@ -11,7 +12,7 @@
 # claude -p 超过 GENERATE_TIMEOUT_SECONDS（默认 20 分钟）没结束就终止：生成途中系统睡眠会让 API 连接挂死，进程永远等不到响应。
 # 测试时可以用环境变量覆盖：LEARN_DIR=<目录> TARGET_DATE=<YYYY-MM-DD> NO_NOTIFY=1（同时关闭微信推送）
 #   CLAUDE_BIN=<假的 claude 脚本> GENERATE_TIMEOUT_SECONDS=<秒> MAX_ATTEMPTS=<次数>
-#   PMSET_BIN=<假的 pmset 脚本>（模拟半醒 / 完全唤醒）
+#   PMSET_BIN=<假的 pmset 脚本>（模拟半醒 / 完全唤醒） RETRY_INTERVAL_SECONDS=<秒>
 set -euo pipefail
 
 LEARN_DIR="${LEARN_DIR:-$HOME/研发英语}"
@@ -21,6 +22,7 @@ CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 GENERATE_TIMEOUT_SECONDS="${GENERATE_TIMEOUT_SECONDS:-1200}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
 PMSET_BIN="${PMSET_BIN:-/usr/bin/pmset}"
+RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-1800}"
 BRANCH="main"
 REMOTE="origin"
 LOG_DIR="$LEARN_DIR/.logs"
@@ -29,6 +31,7 @@ LOCK_DIR="$LOG_DIR/.lock"
 SENDKEY_FILE="${SENDKEY_FILE:-$HOME/.config/daily_english/serverchan_key}"
 WECHAT_MARK="$LOG_DIR/$TARGET_DATE.wechat-sent"
 NOTIFIED_FILE="$LOG_DIR/$TARGET_DATE.notified"
+LAST_ATTEMPT_FILE="$LOG_DIR/$TARGET_DATE.last-attempt" # 上次开始生成的时间（epoch 秒）
 
 mkdir -p "$LOG_DIR"
 
@@ -199,12 +202,12 @@ sync_to_remote() {
     send_wechat "$file" || true
     return 0
   fi
-  notify "$name 已生成并提交，推送失败（可能是网络问题），30 分钟后自动重试"
+  notify "$name 已生成并提交，推送失败（可能是网络问题），稍后自动重试"
   return 1
 }
 
 # 当天已全部完成：文件已在远端分支里（按上次 fetch / push 记下的远端引用判断，不联网），
-# 微信也已发过或不需要发。每 30 分钟的重试触发靠它直接退出。
+# 微信也已发过或不需要发。每 5 分钟的检查靠它直接退出。
 already_done() {
   local name
   name="$(basename "$1")"
@@ -230,7 +233,7 @@ system_fully_awake() {
   grep -qE 'Current System Capabilities are:.*Graphics' <<<"$state"
 }
 
-# 防并发：登录触发、定时触发和 30 分钟重试可能撞在一起。
+# 防并发：登录触发、定时触发和每 5 分钟的检查可能撞在一起。
 # 锁目录里记下持锁进程号，只有那个进程已经不在了（上次异常退出留下的锁）才清掉；
 # 不能只看锁的年龄，否则持锁进程还在跑时锁会被清掉，两次生成同时进行。
 # 旧版本留下的锁没有进程号，超过 30 分钟视为过期。
@@ -282,7 +285,7 @@ prompt="$(<"$PROMPT_FILE")"
 prompt="${prompt//\{\{DATE\}\}/$TARGET_DATE}"
 prompt="${prompt//\{\{DIR\}\}/$LEARN_DIR}"
 
-# 每天最多尝试 MAX_ATTEMPTS 次，避免一直失败时每 30 分钟调一次 claude
+# 每天最多尝试 MAX_ATTEMPTS 次，避免一直失败时反复调用 claude
 attempts=0
 if [[ -f "$LOG_FILE" ]]; then
   attempts="$(grep -c '] start generating for ' "$LOG_FILE" || true)"
@@ -292,7 +295,17 @@ if ((attempts >= MAX_ATTEMPTS)); then
   exit 0
 fi
 
+# 两次生成之间至少隔 RETRY_INTERVAL_SECONDS：每 5 分钟检查一次，但失败后不要每 5 分钟就调一次 claude。
+# 上次超时时会删掉这个记录（见下面），电脑真正醒来后的下一次检查就重试，不用再等。
+if [[ -f "$LAST_ATTEMPT_FILE" ]]; then
+  last_attempt="$(<"$LAST_ATTEMPT_FILE")"
+  if [[ "$last_attempt" =~ ^[0-9]+$ ]] && (($(date +%s) - last_attempt < RETRY_INTERVAL_SECONDS)); then
+    exit 0
+  fi
+fi
+
 log "start generating for $TARGET_DATE in $LEARN_DIR"
+date +%s >"$LAST_ATTEMPT_FILE"
 
 # 只放行读、搜、新建文件；不加载 MCP 服务，禁用 shell / 编辑 / 联网
 claude_status=0
@@ -304,8 +317,10 @@ run_with_timeout "$GENERATE_TIMEOUT_SECONDS" "$CLAUDE_BIN" -p "$prompt" \
   --no-session-persistence \
   >>"$LOG_FILE" 2>&1 || claude_status=$?
 if [[ "$claude_status" == "124" ]]; then
+  # 超时多半是生成途中系统睡着了，不是 claude 本身出错：删掉上次尝试的时间，电脑醒着时下一次检查马上重试
+  rm -f "$LAST_ATTEMPT_FILE"
   # 变量后紧跟中文全角标点时必须加花括号：macOS 自带的 bash 3.2 会把全角字符当成变量名的一部分
-  fail "生成超时：claude 超过 $(((GENERATE_TIMEOUT_SECONDS + 59) / 60)) 分钟未结束（多半是生成途中系统睡眠），已终止，30 分钟后自动重试"
+  fail "生成超时：claude 超过 $(((GENERATE_TIMEOUT_SECONDS + 59) / 60)) 分钟未结束（多半是生成途中系统睡眠），已终止，电脑醒着时几分钟内自动重试"
 elif [[ "$claude_status" != "0" ]]; then
   fail "生成失败：claude 异常退出（退出码 ${claude_status}）"
 fi

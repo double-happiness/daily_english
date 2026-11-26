@@ -18,7 +18,7 @@
 | `.bin/prompt.md` | 生成用提示词（`{{DATE}}` `{{DIR}}` 占位） |
 | `.bin/微信推送配置.md` | Server酱 配置与排查步骤 |
 | `错题本.md` | 复习说错的句子，`- Day N 第 M 句：备注`；生成时前 8 条放进"错题重测"。只在本地（已 gitignore），学习者自己维护，生成提示词只读不改 |
-| `.logs/` | 运行日志、`<日期>.wechat-sent`（微信已发）和 `<日期>.notified`（当天弹过的通知）标记（已 gitignore） |
+| `.logs/` | 运行日志、`<日期>.wechat-sent`（微信已发）、`<日期>.notified`（当天弹过的通知）和 `<日期>.last-attempt`（上次开始生成的时间）标记（已 gitignore） |
 
 ## 常用命令
 
@@ -44,7 +44,7 @@ tail .logs/$(date +%F).log
 # 校验句数
 grep -cE '^### [0-9]+\. ' <每日文件>
 
-# 定时任务：每天 07:00、登录时、每 30 分钟（重试，当天已完成即静默退出）触发
+# 定时任务：每天 07:00、登录时、每 5 分钟（检查，当天已完成即静默退出；生成失败后隔 30 分钟再试，超时后马上重试）触发
 # plist 在 ~/Library/LaunchAgents/local.dev-english-daily.plist（不在仓库里）
 launchctl list | grep dev-english-daily
 ```
